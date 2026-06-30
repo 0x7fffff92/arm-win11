@@ -36,10 +36,32 @@ jobs:
               run: |
                 Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
                 Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
+                # The built-in "Remote Desktop" rules are scoped to Private/Domain.
+                # The Tailscale interface is usually classed as Public, so add an
+                # explicit inbound rule for 3389 that applies to ALL profiles.
                 Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+                New-NetFirewallRule -DisplayName "RDP-Tailscale-AnyProfile" `
+                  -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
+                  -Profile Any -ErrorAction SilentlyContinue
                 Set-Service -Name TermService -StartupType Automatic
                 Start-Service -Name TermService
                 Write-Host "Remote Desktop enabled."
+
+            - name: RDP / firewall diagnostics
+              shell: pwsh
+              run: |
+                Write-Host "=== TermService status ==="
+                Get-Service TermService | Format-List Name, Status, StartType
+                Write-Host "=== Listening on 3389? ==="
+                Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue |
+                  Select-Object LocalAddress, LocalPort, State | Format-Table -AutoSize
+                Write-Host "=== Firewall rules for 3389 ==="
+                Get-NetFirewallPortFilter -Protocol TCP |
+                  Where-Object { $_.LocalPort -eq 3389 } |
+                  ForEach-Object { Get-NetFirewallRule -AssociatedNetFirewallPortFilter $_ -ErrorAction SilentlyContinue } |
+                  Select-Object DisplayName, Enabled, Direction, Action, Profile | Format-Table -AutoSize
+                Write-Host "=== Network adapter profiles ==="
+                Get-NetConnectionProfile | Select-Object InterfaceAlias, NetworkCategory | Format-Table -AutoSize
 
             - name: Set RDP user password
               shell: pwsh
