@@ -63,18 +63,63 @@ jobs:
                   Write-Error "Missing NGROK_AUTHTOKEN secret. Add it in repo Settings > Secrets and variables > Actions."
                   exit 1
                 }
-                # Download ngrok for Windows ARM64
+                # Download ngrok. Windows-on-ARM runs x64 binaries via emulation,
+                # and a dedicated arm64 build may 404, so fall back to amd64.
                 $zip = "$env:RUNNER_TEMP\ngrok.zip"
-                Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-arm64.zip" -OutFile $zip
+                $urls = @(
+                  "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-arm64.zip",
+                  "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+                )
+                $downloaded = $false
+                foreach ($u in $urls) {
+                  try {
+                    Write-Host "Downloading ngrok: $u"
+                    Invoke-WebRequest -Uri $u -OutFile $zip
+                    $downloaded = $true
+                    break
+                  } catch {
+                    Write-Host "Failed: $u -> $($_.Exception.Message)"
+                  }
+                }
+                if (-not $downloaded) { Write-Error "Could not download ngrok."; exit 1 }
                 Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ngrok" -Force
                 $ngrok = "$env:RUNNER_TEMP\ngrok\ngrok.exe"
                 & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
-                # Start ngrok in the background
-                Start-Process -FilePath $ngrok -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "$env:RUNNER_TEMP\ngrok.log"
-                Start-Sleep -Seconds 8
-                # Query the local ngrok API for the public address
-                $tunnels = (Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels").tunnels
-                $addr = ($tunnels | Where-Object { $_.proto -eq "tcp" }).public_url
+
+                # Start ngrok in the background, capturing both stdout and stderr to files.
+                $log = "$env:RUNNER_TEMP\ngrok.log"
+                $errlog = "$env:RUNNER_TEMP\ngrok.err.log"
+                $proc = Start-Process -FilePath $ngrok `
+                  -ArgumentList "tcp", "3389", "--log=stdout", "--log-format=logfmt" `
+                  -PassThru -RedirectStandardOutput $log -RedirectStandardError $errlog
+                Write-Host "ngrok started, PID: $($proc.Id)"
+
+                # Poll the local ngrok API until the tunnel is up (instead of a fixed sleep).
+                $addr = $null
+                for ($i = 0; $i -lt 30; $i++) {
+                  Start-Sleep -Seconds 2
+                  if ($proc.HasExited) {
+                    Write-Host "ngrok exited early with code $($proc.ExitCode)."
+                    break
+                  }
+                  try {
+                    $tunnels = (Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -ErrorAction Stop).tunnels
+                    $addr = ($tunnels | Where-Object { $_.proto -eq "tcp" }).public_url
+                    if ($addr) { break }
+                  } catch {
+                    # API not ready yet, keep polling
+                  }
+                }
+
+                if (-not $addr) {
+                  Write-Host "=========== ngrok stdout ==========="
+                  if (Test-Path $log)    { Get-Content $log }
+                  Write-Host "=========== ngrok stderr ==========="
+                  if (Test-Path $errlog) { Get-Content $errlog }
+                  Write-Error "Failed to establish ngrok tunnel. See ngrok logs above."
+                  exit 1
+                }
+
                 Write-Host "============================================"
                 Write-Host "RDP connect address: $($addr -replace 'tcp://','')"
                 Write-Host "Username: runneradmin"
