@@ -1,0 +1,96 @@
+name: RDP into Windows ARM runner (LarePass)
+
+on:
+    workflow_dispatch:
+        inputs:
+            installer_url:
+                description: 'LarePass installer URL (leave empty to skip install)'
+                required: false
+                default: 'https://cdn.olares.com/LarePass/v1.10.66/LarePass-setup-1.10.66.exe'
+            rdp_password:
+                description: 'Password to set for the RDP user (runneradmin)'
+                required: true
+            keep_alive_minutes:
+                description: 'How long to keep the runner alive for RDP (minutes)'
+                required: true
+                default: '60'
+
+jobs:
+    rdp:
+        runs-on: windows-11-arm
+        steps:
+            - name: Download & install LarePass (optional)
+              if: ${{ github.event.inputs.installer_url != '' }}
+              shell: pwsh
+              run: |
+                $url = "${{ github.event.inputs.installer_url }}"
+                $installer = "$env:RUNNER_TEMP\LarePass-setup.exe"
+                Write-Host "Downloading: $url"
+                Invoke-WebRequest -Uri $url -OutFile $installer
+                Write-Host "Installing silently..."
+                $proc = Start-Process -FilePath $installer -ArgumentList "/S" -PassThru -Wait
+                Write-Host "Installer exit code: $($proc.ExitCode)"
+
+            - name: Enable Remote Desktop
+              shell: pwsh
+              run: |
+                # Allow RDP connections
+                Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
+                # Enable NLA (set to 0 to relax if your client struggles; 1 is more secure)
+                Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
+                # Open the firewall for RDP
+                Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+                # Make sure the RDP service is running
+                Set-Service -Name TermService -StartupType Automatic
+                Start-Service -Name TermService
+                Write-Host "Remote Desktop enabled."
+
+            - name: Set RDP user password
+              shell: pwsh
+              run: |
+                $pwd = ConvertTo-SecureString "${{ github.event.inputs.rdp_password }}" -AsPlainText -Force
+                # GitHub-hosted runners run as 'runneradmin'
+                $user = "runneradmin"
+                Set-LocalUser -Name $user -Password $pwd
+                Write-Host "Password set for user: $user"
+
+            - name: Start ngrok TCP tunnel to RDP (3389)
+              shell: pwsh
+              env:
+                NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+              run: |
+                if (-not $env:NGROK_AUTHTOKEN) {
+                  Write-Error "Missing NGROK_AUTHTOKEN secret. Add it in repo Settings > Secrets and variables > Actions."
+                  exit 1
+                }
+                # Download ngrok for Windows ARM64
+                $zip = "$env:RUNNER_TEMP\ngrok.zip"
+                Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-arm64.zip" -OutFile $zip
+                Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ngrok" -Force
+                $ngrok = "$env:RUNNER_TEMP\ngrok\ngrok.exe"
+                & $ngrok config add-authtoken $env:NGROK_AUTHTOKEN
+                # Start ngrok in the background
+                Start-Process -FilePath $ngrok -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "$env:RUNNER_TEMP\ngrok.log"
+                Start-Sleep -Seconds 8
+                # Query the local ngrok API for the public address
+                $tunnels = (Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels").tunnels
+                $addr = ($tunnels | Where-Object { $_.proto -eq "tcp" }).public_url
+                Write-Host "============================================"
+                Write-Host "RDP connect address: $($addr -replace 'tcp://','')"
+                Write-Host "Username: runneradmin"
+                Write-Host "Password: (the rdp_password you provided)"
+                Write-Host "============================================"
+
+            - name: Keep alive for RDP session
+              shell: pwsh
+              run: |
+                $minutes = [int]"${{ github.event.inputs.keep_alive_minutes }}"
+                Write-Host "Keeping runner alive for $minutes minutes. Connect via RDP now."
+                $deadline = (Get-Date).AddMinutes($minutes)
+                while ((Get-Date) -lt $deadline) {
+                  $remaining = [int]($deadline - (Get-Date)).TotalMinutes
+                  Write-Host "Still alive... ~$remaining min remaining"
+                  Start-Sleep -Seconds 60
+                }
+                Write-Host "Time is up. Shutting down."
+
